@@ -1,0 +1,5 @@
+numpy
+taichi
+PySide6
+Pillow
+matplotlib
