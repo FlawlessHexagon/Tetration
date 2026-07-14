@@ -7,13 +7,13 @@ ti.init(arch=ti.gpu)
 
 @ti.data_oriented
 class TetrationEngine:
-    def __init__(self, max_width=3840, max_height=2160):
+    def __init__(self, max_width: int = 3840, max_height: int = 2160):
         # We pre-allocate a large buffer to avoid re-allocating when resizing up to max resolution
         self.max_width = max_width
         self.max_height = max_height
         
-        # Field for storing the divergence map (0: converged, 1: diverged)
-        self.divergence_map = ti.field(dtype=ti.i32, shape=(max_width, max_height))
+        # Field for storing the iteration count (for smooth coloring)
+        self.iter_map = ti.field(dtype=ti.f32, shape=(max_width, max_height))
         # Image field for output visualization (RGB)
         self.image = ti.Vector.field(3, dtype=ti.f32, shape=(max_width, max_height))
         
@@ -55,46 +55,52 @@ class TetrationEngine:
             z_x = c_x
             z_y = c_y
             
-            diverged = 0
-
-            for k in range(max_iter):
-                r2 = c_x*c_x + c_y*c_y
-                if r2 == 0:
-                    break
-                    
-                r = ti.sqrt(r2)
-                theta = ti.math.atan2(c_y, c_x)
-                
-                # ln(c) = ln|c| + i arg(c)
-                ln_c_x = ti.math.log(r)
-                ln_c_y = theta
-                
-                # z * ln(c)
-                re = z_x * ln_c_x - z_y * ln_c_y
-                im = z_x * ln_c_y + z_y * ln_c_x
-                
-                # exp(z * ln(c))
-                e_re = ti.math.exp(re)
-                z_x = e_re * ti.math.cos(im)
-                z_y = e_re * ti.math.sin(im)
-                
-                if z_x*z_x + z_y*z_y > escape_radius_sq:
-                    diverged = 1
-                    break
+            iter_count = ti.cast(max_iter, ti.f32)
             
-            self.divergence_map[i, j] = diverged
+            # Optimization: ln(c) is constant for a given pixel, so we compute it ONCE outside the hot loop!
+            # ln(c) = ln|c| + i arg(c)
+            c_r2 = c_x*c_x + c_y*c_y
+            if c_r2 > 0:
+                c_r = ti.sqrt(c_r2)
+                c_theta = ti.math.atan2(c_y, c_x)
+                ln_c_x = ti.math.log(c_r)
+                ln_c_y = c_theta
+                
+                for k in range(max_iter):
+                    if z_x*z_x + z_y*z_y > escape_radius_sq:
+                        iter_count = ti.cast(k, ti.f32)
+                        break
+                    
+                    # z * ln(c)
+                    re = z_x * ln_c_x - z_y * ln_c_y
+                    im = z_x * ln_c_y + z_y * ln_c_x
+                    
+                    # exp(z * ln(c))
+                    e_re = ti.math.exp(re)
+                    z_x = e_re * ti.math.cos(im)
+                    z_y = e_re * ti.math.sin(im)
+            
+            self.iter_map[i, j] = iter_count
 
     @ti.kernel
-    def render_kernel(self, nx: ti.i32, ny: ti.i32):
+    def render_kernel(self, nx: ti.i32, ny: ti.i32, max_iter: ti.i32):
+        max_iter_f = ti.cast(max_iter, ti.f32)
         for i, j in ti.ndrange(nx, ny):
-            if self.divergence_map[i, j] == 1:
-                # Diverged: White
-                self.image[i, j] = ti.Vector([1.0, 1.0, 1.0])
-            else:
+            iters = self.iter_map[i, j]
+            if iters >= max_iter_f:
                 # Converged: Black
                 self.image[i, j] = ti.Vector([0.0, 0.0, 0.0])
+            else:
+                # Diverged: Smooth Colorful Cosine Palette Mapping
+                t = iters / 30.0 # Control the color cycling frequency
+                
+                r = 0.5 + 0.5 * ti.math.cos(6.28318 * (1.0 * t + 0.0))
+                g = 0.5 + 0.5 * ti.math.cos(6.28318 * (1.0 * t + 0.1))
+                b = 0.5 + 0.5 * ti.math.cos(6.28318 * (1.0 * t + 0.2))
+                
+                self.image[i, j] = ti.Vector([r, g, b])
 
-    def render(self, nx, ny, max_iter, escape_radius, px, py, scale, rotation=0.0):
+    def render(self, nx: int, ny: int, max_iter: int, escape_radius: float, px: float, py: float, scale: float, rotation: float = 0.0) -> np.ndarray:
         # Ensure nx, ny are within allocated bounds
         nx = min(nx, self.max_width)
         ny = min(ny, self.max_height)
@@ -105,14 +111,13 @@ class TetrationEngine:
             nx, ny, max_iter, escape_radius**2, px, py, scale, aspect_ratio, rotation
         )
         
-        # Update image buffer
-        self.render_kernel(nx, ny)
+        # Update image buffer with colors
+        self.render_kernel(nx, ny, max_iter)
         
         # Return NumPy array for PySide6 or Pillow (shape: nx, ny, 3)
-        # Slicing the field ensures we only grab the used portion
         return self.image.to_numpy()[:nx, :ny]
 
-    def render_map(self, nx, ny, max_iter, escape_radius, px, py, scale, rotation=0.0):
+    def render_map(self, nx: int, ny: int, max_iter: int, escape_radius: float, px: float, py: float, scale: float, rotation: float = 0.0) -> np.ndarray:
         nx = min(nx, self.max_width)
         ny = min(ny, self.max_height)
         aspect_ratio = ny / nx if nx != 0 else 1.0
@@ -120,4 +125,4 @@ class TetrationEngine:
         self.compute_kernel(
             nx, ny, max_iter, escape_radius**2, px, py, scale, aspect_ratio, rotation
         )
-        return self.divergence_map.to_numpy()[:nx, :ny]
+        return self.iter_map.to_numpy()[:nx, :ny]
